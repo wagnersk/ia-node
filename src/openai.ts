@@ -4,7 +4,7 @@ import OpenAI from 'openai';
 import { zodResponseFormat } from 'openai/helpers/zod';
 import { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources";
 import { z } from 'zod';
-import { produtosEmEstoque, produtosEmFalta } from "./database";
+import { produtosEmEstoque, produtosEmFalta, setarEmbedding, todosProdutos } from "./database";
 
 const schema = z.object({
   produtos: z.array(z.string()),
@@ -98,3 +98,28 @@ export const generateProducts = async (message: string) => {
 
   return completion.choices[0].message.parsed;
 };
+
+export const generateEmbedding = async (input: string) => {
+  try {
+    const response = await client.embeddings.create({
+      input,
+      model: 'text-embedding-3-small',
+      encoding_format:  'float',
+    });
+
+    return response.data[0].embedding ?? null;
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
+export const embedProducts = async () => {
+  const produtos = todosProdutos();
+
+  await Promise.allSettled(produtos.map(async (p, index) => {
+    const embedding = await generateEmbedding(`${p.nome}: ${p.descricao}`);
+    if (!embedding) return;
+    setarEmbedding(index, embedding);
+  }))
+}
