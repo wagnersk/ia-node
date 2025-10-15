@@ -1,5 +1,5 @@
-import dotenv from 'dotenv';
-dotenv.config();
+import app from './app';
 
-
-console.log(`API key: ${process.env.OPEN_IA_API_KEY}`);
+ app.listen(3000, () => {
+   console.log('Server is running on port 3000');
+ }  );
