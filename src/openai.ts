@@ -1,10 +1,14 @@
 import dotenv from 'dotenv';
 dotenv.config();
 import OpenAI from 'openai';
-import { zodResponseFormat } from 'openai/helpers/zod';
+import { zodResponseFormat, zodTextFormat } from 'openai/helpers/zod';
 import { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources";
 import { z } from 'zod';
 import { produtosEmEstoque, produtosEmFalta, setarEmbedding, todosProdutos } from "./database";
+import { ResponseCreateParamsNonStreaming } from "openai/resources/responses/responses.mjs";
+import { ReadStream } from 'node:fs'
+import path from "node:path";
+import { writeFile } from "node:fs/promises";
 
 const schema = z.object({
   produtos: z.array(z.string()),
@@ -122,4 +126,150 @@ export const embedProducts = async () => {
     if (!embedding) return;
     setarEmbedding(index, embedding);
   }))
+}
+
+const generateResponse = async<T = null>(params: ResponseCreateParamsNonStreaming) => {
+  const response = await client.responses.parse(params);
+  if (response.output_parsed) return response.output_parsed as T;
+
+  return null;
+}
+
+const createCartPromptChunks = (input: string, products: string[]) => {
+  const chunkSize = 100;
+  const chunks: string[] = [];
+
+  for (let i = 0; i < chunkSize; i += chunkSize) {
+    chunks.push(
+      `Retorne uma lista de até 5 produtos que satisfação a necessidade do usuário.
+
+      Os produtos disponíveis são os seguintes: ${JSON.stringify(
+        products.slice(i, i + chunkSize),
+      )}`,
+    );
+  }
+
+  return chunks;
+}
+
+export const generateCart = async (input: string, products: string[]) => {
+  const ingredientes = await client.responses.create({
+    input,
+    model: 'gpt-4o-mini',
+    instructions: `Retorne uma lista de até 5 ingredientes que satisfação a necessidade do usuário.
+      1. Divida o prato em components principais.
+      2. Para cada componente, forneça uma lista de ingredientes que podem ser usados para prepará-lo.
+    `,
+    text: {
+      format: zodTextFormat(z.object({ ingredientes: z.array(z.string()) }), 'receita'),
+    }
+  })
+
+  const promises = createCartPromptChunks(input, products)
+    .map((chunk) => {
+      return generateResponse<{
+        produtos: string[]
+      }>({
+        model: 'gpt-4o-mini',
+        instructions: chunk,
+        input: `${input}: ingredientes necessários: ${ingredientes}`,
+        text: {
+          format: zodTextFormat(schema, 'carrinho'),
+        }
+      })
+    })
+
+  const results = await Promise.all(promises);
+
+  return results
+    .filter((r): r is { produtos: string[] } => Boolean(r))
+    .flatMap(r => r.produtos);
+}
+
+export const uploadFile = async (file: ReadStream) => {
+  const uploaded = await client.files.create({
+    file,
+    purpose: 'assistants',
+  });
+
+  console.dir(uploaded, { depth: null });
+}
+
+export const createVector = async () => {
+  const vectorStore = await client.vectorStores.create({
+    name: 'node_ia_file_search_class',
+    file_ids: ['file-2GMRzcyTDZp1HjxEx5pfd1']
+  })
+
+  console.dir(vectorStore, { depth: null });
+}
+
+export const createEmbeddingsBatchFile = async (products: string[]) => {
+  const content = products
+    .map((p, i) => ({
+      custom_id: String(i),
+      method: 'POST',
+      url: '/v1/embeddings',
+      body: {
+        input: p,
+        model: 'text-embedding-3-small',
+        encoding_format: 'float',
+      }
+    }))
+    .map((p) => JSON.stringify(p))
+    .join('\n');
+
+  const file = new File([content], 'embeddings-batch.jsonl');
+  const uploaded = await client.files.create({
+    file,
+    purpose: 'batch',
+  });
+
+  return uploaded;
+}
+
+export const createEmbeddingsBatch = async (fileId: string) => {
+  const batch = await client.batches.create({
+    input_file_id: fileId,
+    endpoint: '/v1/embeddings',
+    completion_window: '24h',
+  });
+
+  return batch
+}
+
+export const getBatch = async (id: string) => {
+  return await client.batches.retrieve(id);
+}
+
+export const getFileContent = async (id: string) => {
+  const response = await client.files.content(id);
+
+  return response.text();
+}
+
+export const processEmbeddingsBatchResult = async (batchId) => {
+  const batch = await getBatch(batchId);
+  if (batch.status !== 'completed' || !batch.output_file_id) {
+    return null;
+  }
+
+  const content = await getFileContent(batch.output_file_id);
+  return content.split('\n')
+    .map(line => {
+      try {
+        const parsed = JSON.parse(line) as {
+          custom_id: string;
+          response: { body: { data: { embedding: number[] }[] } }
+        };
+        return {
+          id: Number(parsed.custom_id),
+          embeddings: parsed.response.body.data[0].embedding,
+        };
+      } catch (e) {
+        console.error(e);
+        return null;
+      }
+    })
+    .filter((r): r is { id: number, embeddings: number[]} => Boolean(r))
 }
